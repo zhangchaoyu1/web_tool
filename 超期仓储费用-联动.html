@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>仓储费用多维分析工具 - 维度智能锁定版</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <style>
+        body { margin: 0; background-color: #f5f7fa; font-family: "PingFang SC", "Microsoft YaHei", sans-serif; padding: 20px; display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
+        .header-panel { display: flex; gap: 20px; align-items: center; margin-bottom: 15px; background: #fff; padding: 15px 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); flex-shrink: 0; }
+        .main-layout { display: flex; gap: 20px; flex: 1; min-height: 0; }
+        .chart-card { background: #fff; border-radius: 16px; box-shadow: 0 8px 30px rgba(0,0,0,0.08); padding: 20px; display: flex; flex-direction: column; }
+        .pie-box { flex: 0.9; min-width: 500px; }
+        .bar-box { flex: 1.1; min-width: 600px; }
+        #pie-container, #bar-container { width: 100%; flex: 1; }
+        .control-group { margin-bottom: 15px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .dim-label { font-size: 14px; font-weight: bold; color: #444; }
+        .btn-toggle { padding: 6px 15px; font-size: 13px; border: 1px solid #5470c6; background: #fff; color: #5470c6; cursor: pointer; border-radius: 6px; }
+        .btn-toggle.active { background: #5470c6; color: #fff; }
+        /* 禁用状态按钮的样式 */
+        .btn-toggle:disabled { background: #f5f5f5 !important; color: #bfbfbf !important; border-color: #d9d9d9 !important; cursor: not-allowed !important; }
+        .btn-linkage { padding: 6px 15px; font-size: 13px; border: 1px solid #e6a23c; background: #fff; color: #e6a23c; cursor: pointer; border-radius: 6px; font-weight: bold;}
+        .btn-linkage.active { background: #e6a23c; color: #fff; }
+        .limit-input { width: 60px; padding: 5px; border: 1px solid #ddd; border-radius: 4px; text-align: center; }
+        .hint { font-size: 12px; color: #888; }
+        input[type="file"] { border: 1px dashed #ccc; padding: 5px; border-radius: 6px; background: #fafafa; }
+        .filter-crumbs { font-size: 12px; color: #e6a23c; font-weight: bold; margin-left: auto;}
+    </style>
+</head>
+<body>
+
+<div class="header-panel">
+    <div>
+        <strong>数据上传: </strong>
+        <input type="file" id="excel-file" accept=".xlsx, .xls, .csv" />
+    </div>
+    <div class="hint">支持格式：.xlsx, .xls, .csv | 必需列：asin, 类别, 二级细分类别, 三级细分类别, 每天超期仓储费用</div>
+    <div id="linkage-status" class="filter-crumbs"></div>
+</div>
+
+<div class="main-layout">
+    <div class="chart-card pie-box">
+        <div id="pie-container"></div>
+    </div>
+
+    <div class="chart-card bar-box">
+        <div class="control-group" id="dimension-controls">
+            <span class="dim-label">图表联动:</span>
+            <button class="btn-linkage active" id="btn-toggle-linkage">联动：开</button>
+
+            <span class="dim-label" style="margin-left:15px;">维度:</span>
+            <button class="btn-toggle active" data-dim="类别" data-level="1">一级</button>
+            <button class="btn-toggle" data-dim="二级细分类别" data-level="2">二级</button>
+            <button class="btn-toggle" data-dim="三级细分类别" data-level="3">三级</button>
+            <button class="btn-toggle" data-dim="asin" data-level="4">ASIN</button>
+            
+            <span class="dim-label" style="margin-left:15px;">展示数量:</span>
+            <input type="number" id="show-limit" class="limit-input" value="20" min="1" max="500">
+        </div>
+        <div id="bar-container"></div>
+    </div>
+</div>
+
+<script>
+    const pieChart = echarts.init(document.getElementById('pie-container'));
+    const barChart = echarts.init(document.getElementById('bar-container'));
+    
+    let rawJsonData = []; 
+    let pieDataHistory = [];
+    let pieCurrentData = [];
+    let currentBarDim = '类别';
+    
+    let isLinkageActive = true; 
+    let filterPathHistory = []; // 格式：[{dim: '类别', value: 'xxx', level: 1}]
+
+    // 维度层级映射，用于判定哪些按钮需要被禁用
+    const dimLevelMap = { '类别': 1, '二级细分类别': 2, '三级细分类别': 3, 'asin': 4 };
+
+    // --- 1. 文件读取 ---
+    document.getElementById('excel-file').addEventListener('change', function(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = function(event) {
+            try {
+                const data = event.target.result;
+                const workbook = XLSX.read(data, { type: 'array' });
+                const firstSheetName = workbook.SheetNames[0];
+                const worksheet = workbook.Sheets[firstSheetName];
+                
+                rawJsonData = XLSX.utils.sheet_to_json(worksheet);
+
+                if (rawJsonData.length === 0) {
+                    alert("文件内容为空或格式不正确");
+                    return;
+                }
+
+                // 完全重置状态
+                pieDataHistory = [];
+                filterPathHistory = [];
+                currentBarDim = '类别';
+                
+                // 初始化按钮高亮状态
+                document.querySelectorAll('.btn-toggle').forEach(b => {
+                    b.classList.remove('active');
+                    if(b.getAttribute('data-dim') === '类别') b.classList.add('active');
+                });
+
+                syncDimensionButtons(); 
+                pieCurrentData = processPieData(rawJsonData);
+                renderPie(pieCurrentData);
+                renderBar(currentBarDim);
+            } catch (err) {
+                console.error(err);
+                alert("文件解析失败，请检查文件格式。");
+            }
+        };
+        reader.readAsArrayBuffer(file);
+    });
+
+    // --- 2. 动态过滤函数 ---
+    function getFilteredRawData() {
+        if (!isLinkageActive || filterPathHistory.length === 0) {
+            return rawJsonData;
+        }
+        return rawJsonData.filter(row => {
+            return filterPathHistory.every(filter => {
+                if (filter.dim === 'asin') {
+                    const shortName = row['简称'] || '';
+                    const asinId = row['asin'] || '未知';
+                    const key = shortName ? `${shortName} - ${asinId}` : asinId;
+                    return key === filter.value;
+                }
+                return (row[filter.dim] || '未知') === filter.value;
+            });
+        });
+    }
+
+    // --- 3. 维度按钮控制核心逻辑【新增/优化】 ---
+    function syncDimensionButtons() {
+        // 计算当前应当锁定的最小允许层级
+        // 如果没有过滤，允许层级为 1（全开）；如果点击了“类别”(level 1)，则下一层级条形图必须 >= 2
+        let currentLevel = 1;
+        if (isLinkageActive && filterPathHistory.length > 0) {
+            const lastFilter = filterPathHistory[filterPathHistory.length - 1];
+            currentLevel = lastFilter.level + 1; // 只能看当前点击层级的“下一层”及更深层
+        }
+
+        let needToSwitchDim = false;
+
+        document.querySelectorAll('.btn-toggle').forEach(btn => {
+            const btnLevel = parseInt(btn.getAttribute('data-level'));
+            
+            if (btnLevel < currentLevel) {
+                btn.disabled = true; // 禁用上一层或当前层的反向查看
+                if (btn.classList.contains('active')) {
+                    needToSwitchDim = true; // 当前激发的维度被禁用了，需要强制切走
+                }
+            } else {
+                btn.disabled = false;
+            }
+        });
+
+        // 如果当前选中的维度被禁用了，自动帮用户“向下展开”到当前可用的最浅层级
+        if (needToSwitchDim) {
+            document.querySelectorAll('.btn-toggle').forEach(b => b.classList.remove('active'));
+            
+            // 寻找到第一个没被禁用的按钮
+            const firstAvailableBtn = Array.from(document.querySelectorAll('.btn-toggle')).find(b => !b.disabled);
+            if (firstAvailableBtn) {
+                firstAvailableBtn.classList.add('active');
+                currentBarDim = firstAvailableBtn.getAttribute('data-dim');
+            }
+        }
+        
+        updateLinkageCrumbs();
+    }
+
+    // --- 4. 数据处理与聚合 ---
+    function aggregateData(json, dimension) {
+        let aggMap = {};
+        json.forEach(row => {
+            let key = '';
+            if (dimension === 'asin') {
+                const shortName = row['简称'] || '';
+                const asinId = row['asin'] || '未知';
+                key = shortName ? `${shortName} - ${asinId}` : asinId;
+            } else {
+                key = row[dimension] || '未知';
+            }
+            let fee = parseFloat(row['每天超期仓储费用'] || 0);
+            aggMap[key] = (aggMap[key] || 0) + fee;
+        });
+        return aggMap;
+    }
+
+    function processPieData(json) {
+        const categoryAgg = aggregateData(json, '类别');
+        let tree = {};
+        
+        Object.entries(categoryAgg).forEach(([c1, c1Fee]) => {
+            tree[c1] = { name: c1, value: parseFloat(c1Fee.toFixed(2)), dimType: '类别', level: 1, children: {} };
+            
+            const c1Data = json.filter(row => (row['类别'] || '未知') === c1);
+            const c2Agg = aggregateData(c1Data, '二级细分类别');
+            
+            Object.entries(c2Agg).forEach(([c2, c2Fee]) => {
+                tree[c1].children[c2] = { name: c2, value: parseFloat(c2Fee.toFixed(2)), dimType: '二级细分类别', level: 2, children: {} };
+                
+                const c2Data = c1Data.filter(row => (row['二级细分类别'] || '未知') === c2);
+                const c3Agg = aggregateData(c2Data, '三级细分类别');
+                
+                Object.entries(c3Agg).forEach(([c3, c3Fee]) => {
+                    tree[c1].children[c2].children[c3] = { name: c3, value: parseFloat(c3Fee.toFixed(2)), dimType: '三级细分类别', level: 3, children: {} };
+                    
+                    const c2DataF = c2Data.filter(row => (row['三级细分类别'] || '未知') === c3);
+                    const asinAgg = aggregateData(c2DataF, 'asin');
+                    
+                    Object.entries(asinAgg).forEach(([asin, asinFee]) => {
+                        tree[c1].children[c2].children[c3].children[asin] = { 
+                            name: asin, 
+                            value: parseFloat(asinFee.toFixed(2)),
+                            dimType: 'asin',
+                            level: 4
+                        };
+                    });
+                });
+            });
+        });
+
+        function formatAndSort(obj) {
+            let list = Object.values(obj).map(item => {
+                if (item.children && Object.keys(item.children).length > 0) {
+                    item.children = formatAndSort(item.children);
+                    const childrenSum = item.children.reduce((sum, child) => sum + (child.value || 0), 0);
+                    item.value = parseFloat(childrenSum.toFixed(2));
+                }
+                return item;
+            });
+            return list.sort((a, b) => b.value - a.value);
+        }
+        return formatAndSort(tree);
+    }
+
+    // --- 5. 图表渲染 ---
+    function renderBar(dimension) {
+        const targetData = getFilteredRawData();
+        if (!targetData.length) {
+            barChart.clear();
+            return;
+        }
+
+        const limit = parseInt(document.getElementById('show-limit').value) || 20;
+        const aggMap = aggregateData(targetData, dimension);
+
+        let sortedData = Object.entries(aggMap)
+            .map(([name, value]) => ({ name, value: parseFloat(value.toFixed(2)) }))
+            .sort((a, b) => b.value - a.value)
+            .slice(0, limit); 
+
+        const option = {
+            title: { text: `费用 TOP ${limit} (按${dimension})`, left: 'center' },
+            tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' }, formatter: '{b}: <b>${c}</b>' },
+            grid: { left: '3%', right: '15%', bottom: '5%', containLabel: true },
+            xAxis: { type: 'value', axisLabel: { formatter: '${value}' } },
+            yAxis: { 
+                type: 'category', 
+                data: sortedData.map(d => d.name).reverse(),
+                axisLabel: { interval: 0, width: 150, overflow: 'truncate' } 
+            },
+            series: [{
+                name: '仓储费',
+                type: 'bar',
+                data: sortedData.map(d => d.value).reverse(),
+                label: { show: true, position: 'right', formatter: '${c}' },
+                itemStyle: { color: '#91cc75', borderRadius: [0, 4, 4, 0] }
+            }]
+        };
+        barChart.setOption(option, true);
+    }
+
+    function renderPie(data) {
+        const canGoBack = pieDataHistory.length > 0;
+        const option = {
+            title: { text: '仓储费用占比钻取分析', subtext: canGoBack ? '点击中心返回' : '点击扇区钻取', left: 'center' },
+            tooltip: { trigger: 'item', formatter: '{b}<br/>费用: ${c} ({d}%)' },
+            graphic: canGoBack ? [{
+                type: 'group', left: 'center', top: 'center',
+                onclick: () => { 
+                    pieCurrentData = pieDataHistory.pop(); 
+                    if (isLinkageActive) {
+                        filterPathHistory.pop();
+                        syncDimensionButtons(); // 返回时解禁对应的维度按钮
+                        renderBar(currentBarDim);
+                    }
+                    renderPie(pieCurrentData); 
+                },
+                children: [
+                    { type: 'circle', shape: { r: 40 }, style: { fill: '#fff', stroke: '#5470c6', lineWidth: 2 } },
+                    { type: 'text', left: 'center', top: 'center', style: { text: '返回', font: 'bold 14px sans-serif', fill: '#5470c6' } }
+                ]
+            }] : [],
+            series: [{
+                type: 'pie', radius: ['35%', '65%'], center: ['50%', '55%'],
+                data: data,
+                label: { show: true, formatter: '{b}\n${c}' },
+                itemStyle: { borderRadius: 5, borderColor: '#fff', borderWidth: 2 }
+            }]
+        };
+        pieChart.setOption(option, true);
+    }
+
+    function updateLinkageCrumbs() {
+        const statusEl = document.getElementById('linkage-status');
+        if (!isLinkageActive) {
+            statusEl.innerHTML = "⚠️ 联动已关闭（显示全量数据）";
+            return;
+        }
+        if (filterPathHistory.length === 0) {
+            statusEl.innerHTML = "🔍 当前过滤范围：全选总计";
+        } else {
+            const pathStr = filterPathHistory.map(f => f.value).join(' > ');
+            statusEl.innerHTML = `🔍 当前过滤范围：${pathStr}`;
+        }
+    }
+
+    // --- 6. 交互逻辑 ---
+    pieChart.on('click', (params) => {
+        if (params.data && params.data.children) {
+            pieDataHistory.push(pieCurrentData);
+            
+            if (isLinkageActive) {
+                filterPathHistory.push({
+                    dim: params.data.dimType,
+                    value: params.data.name,
+                    level: params.data.level
+                });
+                syncDimensionButtons(); // 核心：下钻时锁定不能选的低层级按钮，并自动调整当前条形图维度
+                renderBar(currentBarDim);
+            }
+            
+            pieCurrentData = params.data.children;
+            renderPie(pieCurrentData);
+        }
+    });
+
+    document.getElementById('dimension-controls').addEventListener('click', (e) => {
+        if (e.target.classList.contains('btn-toggle') && !e.target.disabled) {
+            document.querySelectorAll('.btn-toggle').forEach(b => b.classList.remove('active'));
+            e.target.classList.add('active');
+            currentBarDim = e.target.getAttribute('data-dim');
+            renderBar(currentBarDim);
+        }
+    });
+
+    document.getElementById('btn-toggle-linkage').addEventListener('click', (e) => {
+        isLinkageActive = !isLinkageActive;
+        if (isLinkageActive) {
+            e.target.classList.add('active');
+            e.target.innerText = "联动：开";
+        } else {
+            e.target.classList.remove('active');
+            e.target.innerText = "联动：关";
+        }
+        syncDimensionButtons(); // 切换联动开关时，重新计算按钮禁用状态
+        renderBar(currentBarDim); 
+    });
+
+    document.getElementById('show-limit').addEventListener('change', () => renderBar(currentBarDim));
+    window.onresize = () => { pieChart.resize(); barChart.resize(); };
+</script>
+
+</body>
+</html>
